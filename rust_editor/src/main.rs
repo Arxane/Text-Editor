@@ -20,6 +20,20 @@ struct Editor {
     dirty: bool, //tracks whether if file is modified
     last_key_time: Instant, //Timestamp of last key press
     last_key: Option<KeyEvent>, //last key event, used for debouncing repeated keypresses
+    col_offset: usize, //to check for test more than columns
+    undo_stack: Vec<EditorState>,
+    redo_stack: Vec<EditorState>,
+    search_mode: bool,
+    search_query: String,
+    search_results: Vec<(usize, usize)>, // (row, col)
+    current_match: usize,
+}
+
+#[derive(Clone)]
+struct EditorState{
+    buffer: Vec<String>,
+    cursor_x: usize,
+    cursor_y: usize,
 }
 
 impl Editor {
@@ -36,6 +50,13 @@ impl Editor {
             dirty: false,
             last_key_time: Instant::now(), //Initialize debounce timer
             last_key: None, //No previous key pressed
+            col_offset: 0,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            search_mode: false,
+            search_query: String::new(),
+            search_results: Vec::new(),
+            current_match: 0,
         })
     }
 
@@ -63,10 +84,27 @@ impl Editor {
             if i < self.rows.len() {
                 let line = &self.rows[i];
                 execute!(stdout, cursor::MoveTo(0,i as u16))?;
-                let tokens = self.highlight_line(line);
-                for (token,color) in tokens {
-                    execute!(stdout, Print(token.with(color)))?;
+                let visible = if self.col_offset < line.len() {
+                    &line[self.col_offset..]
+                } else {
+                    ""
+                };
+                let screen_cols = self.screen_cols as usize;
+                let mut display_line = String::new();
+
+                if self.col_offset > 0 {
+                    display_line.push('»');
+                    //Make sure we only render more characters
+                    display_line.push_str(&visible.chars().take(screen_cols - 1).collect::<String>());
+                } else {
+                    display_line.push_str(&visible.chars().take(screen_cols).collect::<String>());
                 }
+
+                // Apply syntax highlighting
+                let tokens = self.highlight_line(&display_line);
+                for (token, color) in tokens {
+                    execute!(stdout, Print(token.with(color)))?;
+        }
             } else {
                 execute!(stdout, Print("~"))?; // Placeholder for unused lines
             }
@@ -84,8 +122,11 @@ impl Editor {
         )?;
         self.draw_rows(stdout)?;  // Draw current editor content
         self.draw_status_bar(stdout)?; //draw status bar
+        if self.search_mode {
+            self.draw_search_prompt(stdout)?;
+        }
         // restrict cursor within visible screen
-        let cx = self.cursor_x.min(self.screen_cols as usize - 1) as u16;
+        let cx = self.cursor_x.saturating_sub(self.col_offset) as u16;
         let cy = self.cursor_y.min(self.screen_rows as usize - 1) as u16;        
         execute!(
             stdout,
@@ -122,7 +163,20 @@ impl Editor {
                 }
                 self.dirty = false; // Mark as not dirty after save
             }
+            KeyCode::Char('z') if event.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(prev) = self.undo_stack.pop() {
+                    self.redo_stack.push(self.snapshot());
+                    self.restore(prev);
+                }
+            }
+            KeyCode::Char('x') if event.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(next) = self.redo_stack.pop() {
+                    self.undo_stack.push(self.snapshot());
+                    self.restore(next);
+                }
+            }
             KeyCode::Char(c) => {
+                self.push_undo();
                 if self.cursor_y < self.rows.len() {
                     let line = &mut self.rows[self.cursor_y];
                     if self.cursor_x <= line.len() {
@@ -133,6 +187,7 @@ impl Editor {
                 }
             }
             KeyCode::Backspace => {
+                self.push_undo();
                 if self.cursor_y < self.rows.len() {
                     if self.cursor_x > 0 {
                         let line = &mut self.rows[self.cursor_y];
@@ -149,6 +204,7 @@ impl Editor {
                 }
             }
             KeyCode::Enter => {
+                self.push_undo();
                 if self.cursor_y < self.rows.len() {
                     let line = &mut self.rows[self.cursor_y];
                     let new_line = line.split_off(self.cursor_x);
@@ -188,7 +244,16 @@ impl Editor {
                     self.cursor_x = self.cursor_x.min(self.rows[self.cursor_y].len());
                 }
             }
+            
+
             _ => {}
+        }
+        let screen_cols = self.screen_cols as usize;
+
+        if self.cursor_x < self.col_offset {
+            self.col_offset = self.cursor_x;
+        } else if self.cursor_x >= self.col_offset + screen_cols {
+            self.col_offset = self.cursor_x - screen_cols + 1;
         }
         false
     }
@@ -285,7 +350,114 @@ impl Editor {
         }
 
         result
+    }
+    //save state
+    fn snapshot(&self) -> EditorState {
+        EditorState {
+            buffer: self.rows.clone(),
+            cursor_x: self.cursor_x,
+            cursor_y: self.cursor_y,
         }
+    }
+    //saves rows from buffer
+    fn restore(&mut self, state: EditorState) {
+        self.rows = state.buffer;
+        self.cursor_x = state.cursor_x;
+        self.cursor_y = state.cursor_y;
+    }
+    fn push_undo(&mut self) {
+        self.undo_stack.push(self.snapshot());
+        self.redo_stack.clear(); // Clear redo history on new edit
+    }
+    //start search prompt
+    fn start_search(&mut self) {
+        self.search_mode = true;
+        self.search_query.clear();
+        self.search_results.clear();
+        self.current_match = 0;
+    }
+    //search rows for query and keep it in search_results
+    fn perform_search(&mut self){
+        self.search_results.clear();
+        if self.search_query.is_empty() {
+            return;
+        }
+        let q = self.search_query.to_lowercase();
+        for (i, line) in self.rows.iter().enumerate(){
+            let line_lower = line.to_lowercase();
+            let mut start = 0;
+            while let Some(pos) = line_lower[start..].find(&q){
+                self.search_results.push((i,start+pos)); //push into search_results if found
+                start += pos+1; // continue searching
+            }
+        }
+        self.current_match = 0;
+        if let Some(&(row,col)) = self.search_results.get(0){
+            self.cursor_x = row;
+            self.cursor_y = col;
+            self.scroll_to_cursor();
+        }
+    }
+
+    fn scroll_to_cursor(&mut self) {
+        let screen_cols = self.screen_cols as usize;
+        if self.cursor_x < self.col_offset {
+            self.col_offset = self.cursor_x;
+        } else if self.cursor_x >= self.col_offset + screen_cols {
+            self.col_offset = self.cursor_x - screen_cols + 1;
+        }
+    }
+    fn draw_search_prompt(&self, stdout: &mut io::Stdout) -> std::io::Result<()> {
+        use crossterm::style::{SetAttribute, Attribute, SetBackgroundColor, SetForegroundColor, Color};
+        execute!(
+            stdout,
+            cursor::MoveTo(0, self.screen_rows - 1),
+            Clear(ClearType::CurrentLine),
+            SetBackgroundColor(Color::Black),
+            SetForegroundColor(Color::Yellow),
+            SetAttribute(Attribute::Bold),
+            Print(format!("Search: {}", self.search_query)),
+            SetAttribute(Attribute::Reset),
+            SetForegroundColor(Color::Reset),
+            SetBackgroundColor(Color::Reset),
+        )
+    }
+    fn process_search_keypress(&mut self, event: KeyEvent) -> bool {
+        if event.kind != KeyEventKind::Press {
+            return false;
+        }
+        match event.code {
+            KeyCode::Esc => {
+                self.search_mode = false;
+                self.search_query.clear();
+                self.search_results.clear();
+                return false;
+            }
+            KeyCode::Enter => {
+                if self.search_results.is_empty() {
+                    return false;
+                }
+                // Go to next match
+                self.current_match = (self.current_match + 1) % self.search_results.len();
+                let (row, col) = self.search_results[self.current_match];
+                self.cursor_y = row;
+                self.cursor_x = col;
+                self.scroll_to_cursor();
+            }
+            KeyCode::Backspace => {
+                self.search_query.pop();
+                self.perform_search();
+            }
+            KeyCode::Char(c) => {
+                self.search_query.push(c);
+                self.perform_search();
+            }
+            _ => {}
+        }
+        false
+    }
+
+
 }
 
 // Entry point for the program
@@ -315,8 +487,14 @@ fn main() -> std::io::Result<()> {
         // Handling inputs
         if let Event::Key(key_event) = event::read()? {
             // Removed debug println! statement
-            if editor.process_keypress(key_event) {
-                break; // Exit editor on Alt + q
+            if editor.search_mode {
+                editor.process_search_keypress(key_event);
+            } else {
+                if key_event.code == KeyCode::Char('f') && key_event.modifiers.contains(KeyModifiers::ALT){
+                    editor.start_search();
+                } else if editor.process_keypress(key_event){
+                    break;
+                }
             }
         }
     }
