@@ -486,7 +486,6 @@ fn main() -> std::io::Result<()> {
         editor.refresh_screen(&mut stdout)?; // Redraw screen
         // Handling inputs
         if let Event::Key(key_event) = event::read()? {
-            // Removed debug println! statement
             if editor.search_mode {
                 editor.process_search_keypress(key_event);
             } else {
